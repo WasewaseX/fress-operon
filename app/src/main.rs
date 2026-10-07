@@ -563,7 +563,10 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
-fn serve(request: wry::http::Request<Vec<u8>>) -> wry::http::Response<Vec<u8>> {
+fn serve(
+    _id: wry::WebViewId,
+    request: wry::http::Request<Vec<u8>>,
+) -> wry::http::Response<std::borrow::Cow<'static, [u8]>> {
     let uri = request.uri().to_string();
     // Windows serves custom protocols over https://fress.localhost/<path>;
     // other platforms over fress://localhost/<path>.
@@ -588,13 +591,13 @@ fn serve(request: wry::http::Request<Vec<u8>>) -> wry::http::Response<Vec<u8>> {
             .status(200)
             .header("Content-Type", mime_for(&decoded))
             .header("Content-Security-Policy", CSP)
-            .body(bytes)
+            .body(std::borrow::Cow::Owned(bytes))
             .unwrap(),
         None => wry::http::Response::builder()
             .status(404)
             .header("Content-Type", "text/plain; charset=utf-8")
             .header("Content-Security-Policy", CSP)
-            .body(b"not found".to_vec())
+            .body(std::borrow::Cow::Owned(b"not found".to_vec()))
             .unwrap(),
     }
 }
@@ -728,5 +731,4 @@ fn main() {
             _ => {}
         }
     })
-    .expect("event loop");
 }
