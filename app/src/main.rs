@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
 use wry::{WebView, WebViewBuilder};
 
@@ -645,8 +645,7 @@ fn main() {
     let ipc_proxy = proxy.clone();
     let shim = include_str!("shim.js").to_string();
     let mut web_context = wry::WebContext::new(Some(webview_data));
-    let webview = WebViewBuilder::new_as_child(&window)
-        .with_web_context(&mut web_context)
+    let webview = WebViewBuilder::with_web_context(&mut web_context)
         .with_url(INDEX_URL)
         .with_initialization_script(&shim)
         .with_custom_protocol("fress".into(), serve)
@@ -662,7 +661,7 @@ fn main() {
                 }
             }
         })
-        .build()
+        .build_as_child(&window)
         .expect("webview");
 
     let mut state = State {
