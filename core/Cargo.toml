@@ -1,0 +1,11 @@
+[package]
+name = "fresscore"
+version = "1.0.2-beta"
+edition = "2021"
+description = "Fress Operon Edition core — embeds the operon interpreter and bridges the native webview host to the Fress backend logic written in operon"
+
+[dependencies]
+operon = { git = "https://github.com/WasewaseX/operon-lang-dev", rev = "215ff0b" }
+
+[dev-dependencies]
+serde_json = "1"

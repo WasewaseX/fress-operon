@@ -1,0 +1,42 @@
+Fress — NOTICE and attribution
+==============================
+
+Fress is released under the MIT License. The full license text is in the
+LICENSE file that accompanies this distribution; nothing in this file
+changes, replaces, or adds to that license.
+
+Copyright
+---------
+
+Copyright (c) 2026 WasewaseX and Fress contributors
+
+Source files in this repository carry an SPDX license identifier header
+(`SPDX-License-Identifier: MIT`) referencing the license in the LICENSE
+file.
+
+Trademarks and project names
+----------------------------
+
+The name "Fress" and the Fress logo identify this project and its
+distributions. They are not an authorization to present a modified build,
+repack, or fork as an official Fress release. Builds that reuse this
+source code are welcome, but they must make their origin clear.
+
+All third-party application names, logos, and icons shown in the catalog
+(the `public/icons/` and `public/pp-logos/` assets) and referenced by the
+app remain the trademarks and copyrighted property of their respective
+projects and owners. They are used solely to identify those projects.
+Their presence does not imply endorsement of Fress by them, and Fress
+claims no affiliation with them. Each catalog entry links to the
+project's own website and source code, where its actual license applies.
+
+Third-party content bundled with Fress
+--------------------------------------
+
+- ente's PrivacyPack (https://github.com/ente-io/privacypack): the
+  category list used by the Privacy tab is derived from this
+  CC0-1.0-licensed dataset and is attributed in the app itself.
+- All Rust and npm dependencies remain under their own licenses; see
+  `src-tauri/Cargo.lock`, `package-lock.json`, and the upstream projects.
+  Dependency licenses are disclosed automatically in the distributed
+  bundles as required by those licenses.

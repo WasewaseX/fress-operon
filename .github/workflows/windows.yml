@@ -1,0 +1,83 @@
+name: Windows build + release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the ORIGINAL frontend from pinned upstream (upstream untouched)
+        shell: bash
+        run: bash scripts/build-frontend.sh
+
+      - name: Headless brain tests
+        run: cargo test -p fresscore
+
+      - name: Build host (release)
+        run: cargo build --release -p fress-operon
+
+      - name: Smoke the shipped exe (GUI boot path, brain, embedded frontend)
+        run: |
+          $exe = "target\release\fress-operon.exe"
+          if (-not (Test-Path $exe)) { throw "exe missing" }
+          $out = & $exe --smoke 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch "SMOKE OK") { throw "smoke failed" }
+          if ($out -notmatch "fress-operon") { throw "brain boot payload wrong" }
+
+      - name: Size gate (the lite deal: <= 30 MB)
+        shell: bash
+        run: |
+          SIZE=$(stat -c%s target/release/fress-operon.exe)
+          echo "exe bytes: $SIZE"
+          if [ "$SIZE" -gt 31457280 ]; then echo "OVER 30 MB"; exit 1; fi
+
+      - name: Package (zip + SHA256SUMS)
+        shell: bash
+        run: |
+          mkdir -p stage
+          cp target/release/fress-operon.exe stage/Fress-Operon.exe
+          cp README.md stage/README.md
+          cp LICENSE stage/LICENSE
+          cp NOTICE stage/NOTICE
+          cd stage
+          zip -q -r ../Fress-Operon-win-x64.zip .
+          cd ..
+          sha256sum Fress-Operon-win-x64.zip > SHA256SUMS.txt
+          EXE_SHA=$(sha256sum stage/Fress-Operon.exe | cut -d' ' -f1)
+          echo "exe sha256: $EXE_SHA" >> SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Verify zip size again (with docs)
+        shell: bash
+        run: |
+          SIZE=$(stat -c%s Fress-Operon-win-x64.zip)
+          echo "zip bytes: $SIZE"
+          if [ "$SIZE" -gt 31457280 ]; then echo "ZIP OVER 30 MB"; exit 1; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Fress-Operon-win-x64
+          path: |
+            Fress-Operon-win-x64.zip
+            SHA256SUMS.txt
+
+      - name: Release (tag runs only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Fress-Operon-win-x64.zip
+            SHA256SUMS.txt

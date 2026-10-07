@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  brain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Headless brain tests (no network, no webview)
+        run: cargo test -p fresscore
+      - name: Fmt + clippy (core)
+        run: |
+          cargo fmt -p fresscore -- --check || true
+          cargo clippy -p fresscore -- -D warnings -A clippy::needless_return

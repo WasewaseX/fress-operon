@@ -1,0 +1,4 @@
+/target
+app/frontend-dist/
+Cargo.lock.orig
+*.log

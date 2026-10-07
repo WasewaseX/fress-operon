@@ -1,0 +1,25 @@
+[package]
+name = "fress-operon"
+version = "1.0.2-beta"
+edition = "2021"
+description = "Fress Operon Edition — the Fress directory app ported to the operon language: the ORIGINAL React GUI unchanged in a native webview window, the entire backend decision logic in operon"
+build = "build.rs"
+
+[[bin]]
+name = "fress-operon"
+path = "src/main.rs"
+
+[dependencies]
+fresscore = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tao = "0.30"
+wry = "0.46"
+ureq = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
+sha2 = "0.10"
+dirs = "5"
+include_dir = "0.7"
+rfd = "0.15"
+
+[package.metadata.notes]
+gui = "the Fress React frontend ships byte-identical; this host only replaces the Tauri IPC core"

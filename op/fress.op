@@ -1,0 +1,669 @@
+# ============================================================
+# fress.op — the Fress Operon Edition BRAIN.
+#
+# Fress (github.com/WasewaseX/Fress) ported to the operon language.
+# The original app was a Tauri 2 desktop app: a React/TS frontend (the GUI,
+# shipped here BYTE-IDENTICAL) talking over Tauri IPC to a Rust core.
+# This port keeps the GUI untouched and moves every DECISION the Rust core
+# made into this operon program:
+#
+#   - repo/URL validation and the resolver host allowlist
+#   - GitHub release fetching, prerelease filtering, release mapping
+#   - the vendor-manifest text fetch (https-only, 2 MiB cap policy)
+#   - F-Droid package resolution (suggestedVersionCode rules)
+#   - download filename policy (Unicode-aware sanitize, Windows reserved
+#     device names, RFC 5987 percent-decoding, path-escape refusal)
+#   - download job identity + auto-retry policy (2 network retries,
+#     backoff 2s then 4s)
+#   - checksum verification verdicts (mismatch = delete + error, never
+#     a finished-looking file)
+#
+# The HOST (Rust, app/) is the BODY: the webview window, the HTTP/FS
+# effectors, progress math, and the sha256 streaming. Protocol: every
+# bridge call passes ONE JSON document and reads ONE JSON document back
+# through the language's own json_parse/json_str.
+#
+# Command genes (host -> brain):
+#   fetch_latest_release({repo})
+#   fetch_recent_releases({repo, count, include_flagged})
+#   fetch_text({url})
+#   fetch_fdroid_package({pkg})
+#   start_download({url, filename, directory, expected_sha256, resume,
+#                   downloads_dir})
+#   cancel_download({id})
+#   sanitize({name})
+# Continuations:
+#   fress_on_net({ctx, resp})      - host answers a net_get instruction
+#   dl_on_result({id, outcome,..}) - host reports a download outcome
+#
+# Instruction envelopes the brain may return:
+#   {"ok": true, "result": <final JSON>}              - done, resolve IPC
+#   {"ok": false, "error": "user-facing message"}     - reject IPC
+#   {"ok": true, "need": "net_get", "url", "headers", "ctx"} - call host
+#   {"ok": true, "plan": {...}}                       - spawn download
+#   {"ok": true, "cancel": true}
+#   (dl_on_result) {"action": "finalize"|"delete_and_error"|"error"|"retry", ...}
+# ============================================================
+
+let APP_VERSION = "1.0.2-beta"
+let BODY_CAP = 2097152
+let MAX_AUTO_RETRIES = 2
+
+# The exact allowlist from the original core: vendor manifest hosts the
+# official download resolvers may read. Anything not listed is refused
+# BEFORE a request is made - the generic text fetch can never become an
+# open proxy.
+let ALLOWED_HOSTS = [
+    "get.videolan.org",
+    "www.videolan.org",
+    "download.blender.org",
+    "download.kde.org",
+    "download.documentfoundation.org",
+    "www.gimp.org",
+    "download.gimp.org",
+    "inkscape.org",
+    "media.inkscape.org",
+    "www.zotero.org",
+    "download.zotero.org",
+    "updates.signal.org",
+    "aus1.torproject.org",
+    "dist.torproject.org",
+    "proton.me",
+    "packages.element.io",
+    "download.nextcloud.com",
+    "gitlab.com",
+    "www.sumatrapdfreader.org",
+    "api.github.com",
+    "raw.githubusercontent.com",
+]
+
+# Download job bookkeeping (ids and retry attempts). The original kept a
+# DownloadRegistry in memory; jobs do not survive a restart, and neither
+# does this.
+let STATE = {"next_id": 0, "downloads": {}}
+
+gene main() {
+    return {"ok": true, "app": "fress-operon", "version": APP_VERSION,
+            "allowlist": len(ALLOWED_HOSTS)}
+}
+
+# ---------- helpers ----------
+
+gene err(msg) {
+    return {"ok": false, "error": msg}
+}
+
+gene need_net(url, accept, ctx) {
+    let headers = {}
+    if accept != "" {
+        headers["Accept"] = accept
+    }
+    return {"ok": true, "need": "net_get", "url": url, "headers": headers, "ctx": ctx}
+}
+
+gene clean_repo(repo) {
+    let r = str(repo).trim()
+    while r.starts("/") {
+        r = char_slice(r, 1, len(r))
+    }
+    while r.ends("/") {
+        r = char_slice(r, 0, len(r) - 1)
+    }
+    return r
+}
+
+# Char-indexed substring search (strings have no index_of builtin; the
+# list method is list-only). Names and hosts are short - O(n*m) is fine.
+gene str_find(s, sub) {
+    let n = len(s)
+    let m = len(sub)
+    if m == 0 {
+        return 0
+    }
+    if m > n {
+        return -1
+    }
+    let i = 0
+    while i <= n - m {
+        if s.slice(i, i + m) == sub {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+# Unicode-aware alphanumeric: any letter (L*) or number (N*) from any
+# script survives sanitization - a Japanese PDF must not land on disk as
+# "__.pdf".
+gene is_alnum(c) {
+    let cat = char_category(c)
+    if cat == null {
+        return false
+    }
+    let f = char_at(cat, 0)
+    return f == "L" or f == "N"
+}
+
+gene is_safe_char(c) {
+    if is_alnum(c) {
+        return true
+    }
+    return c == "." or c == "-" or c == "_" or c == "(" or c == ")"
+}
+
+# Port of the original sanitize_filename: every unsafe char becomes '_',
+# then '_' runs and whitespace are trimmed off both ends. "." and ".."
+# survive the character filter but would walk the directory tree, so they
+# collapse to the safe default. Windows reserved device names (checked on
+# the segment before the FIRST dot - "NUL.tar.gz" is reserved like "NUL")
+# collapse too, so a server-supplied name can never trigger a
+# finalize-time failure.
+gene sanitize_filename(name) {
+    let cleaned = ""
+    let i = 0
+    let n = len(name)
+    while i < n {
+        let c = char_at(name, i)
+        if is_safe_char(c) {
+            cleaned = cleaned + c
+        } else {
+            cleaned = cleaned + "_"
+        }
+        i += 1
+    }
+    let t = cleaned.trim()
+    while t.starts("_") {
+        t = char_slice(t, 1, len(t))
+    }
+    while t.ends("_") {
+        t = char_slice(t, 0, len(t) - 1)
+    }
+    if t == "" or t == "." or t == ".." {
+        return "download.bin"
+    }
+    let first_dot = str_find(t, ".")
+    let first_seg = t
+    if first_dot > 0 {
+        first_seg = char_slice(t, 0, first_dot)
+    }
+    let seg = first_seg.upper()
+    if seg == "CON" or seg == "PRN" or seg == "AUX" or seg == "NUL" {
+        return "download.bin"
+    }
+    if seg.starts("COM") or seg.starts("LPT") {
+        let tail = char_slice(seg, 3, len(seg))
+        if len(tail) == 1 {
+            let d = char_at(tail, 0)
+            if d >= "0" and d <= "9" {
+                return "download.bin"
+            }
+        }
+    }
+    return t
+}
+
+# RFC 5987 ext-values are percent-encoded; without decoding, a Japanese
+# PDF would land on disk as a literal "%E6%97%A5...". Byte-level decode
+# with lossy UTF-8 reassembly (the original used from_utf8_lossy).
+gene percent_decode(s) {
+    let raw = bytes_from_str(s)
+    let out = []
+    let n = len(raw)
+    let i = 0
+    let hexd = "0123456789abcdef"
+    while i < n {
+        let b = raw[i]
+        if b == 37 and i + 2 < n {
+            let h1 = str_find(hexd, chr(raw[i + 1]).lower())
+            let h2 = str_find(hexd, chr(raw[i + 2]).lower())
+            if h1 >= 0 and h2 >= 0 {
+                push(out, h1 * 16 + h2)
+                i += 3
+            } else {
+                push(out, b)
+                i += 1
+            }
+        } else {
+            push(out, b)
+            i += 1
+        }
+    }
+    let decoded = try_str_from_bytes(bytes_from_list(out))
+    if is_err(decoded) {
+        return s
+    }
+    return unwrap(decoded)
+}
+
+# Minimal URL surgery for the text fetch: scheme check, host extraction
+# (no userinfo, no port), lowercase. Mirrors what the original got from
+# reqwest::Url: "Not a valid URL" without a scheme, https-only, "URL has
+# no host" on an empty host.
+gene url_host(url) {
+    let p = str_find(url, "://")
+    if p < 0 {
+        return {"valid": false, "reason": "Not a valid URL"}
+    }
+    let scheme = char_slice(url, 0, p).lower()
+    if scheme != "https" {
+        return {"valid": false, "reason": "Only https URLs are allowed"}
+    }
+    let rest = char_slice(url, p + 3, len(url))
+    let slash = str_find(rest, "/")
+    let authority = rest
+    if slash >= 0 {
+        authority = char_slice(rest, 0, slash)
+    }
+    # userinfo (user:pass@host) is not in the allowlist business
+    let at = str_find(authority, "@")
+    if at >= 0 {
+        authority = char_slice(authority, at + 1, len(authority))
+    }
+    let colon = str_find(authority, ":")
+    if colon >= 0 {
+        authority = char_slice(authority, 0, colon)
+    }
+    let host = authority.lower()
+    if host == "" {
+        return {"valid": false, "reason": "URL has no host"}
+    }
+    return {"valid": true, "host": host}
+}
+
+gene in_allowlist(host) {
+    return ALLOWED_HOSTS.index_of(host) >= 0
+}
+
+# ---------- GitHub release mapping (port of parse_gh_release) ----------
+
+gene str_or(v, fallback) {
+    if type(v) == "str" {
+        let t = v.trim()
+        if t != "" {
+            return t
+        }
+    }
+    return fallback
+}
+
+gene parse_gh_release(body, repo) {
+    if type(body) != "map" {
+        return null
+    }
+    let tag = ""
+    if has(body, "tag_name") and type(body["tag_name"]) == "str" {
+        tag = body["tag_name"]
+    }
+    if tag == "" {
+        return null
+    }
+    let name = tag
+    if has(body, "name") {
+        name = str_or(body["name"], tag)
+    }
+    let published_at = ""
+    if has(body, "published_at") and type(body["published_at"]) == "str" {
+        published_at = body["published_at"]
+    }
+    let html_url = "https://github.com/{repo}/releases"
+    if has(body, "html_url") and type(body["html_url"]) == "str" {
+        if body["html_url"] != "" {
+            html_url = body["html_url"]
+        }
+    }
+    let assets = []
+    if has(body, "assets") and type(body["assets"]) == "list" {
+        for a in body["assets"] {
+            if type(a) != "map" {
+                continue
+            }
+            let aname = ""
+            let dl = ""
+            let size = 0
+            if has(a, "name") and type(a["name"]) == "str" {
+                aname = a["name"]
+            }
+            if has(a, "browser_download_url") and type(a["browser_download_url"]) == "str" {
+                dl = a["browser_download_url"]
+            }
+            if has(a, "size") and type(a["size"]) == "int" {
+                size = a["size"]
+            }
+            if aname == "" or dl == "" {
+                continue
+            }
+            push(assets, {"name": aname, "size": size, "download_url": dl})
+        }
+    }
+    return {"tag": tag, "name": name, "published_at": published_at,
+            "html_url": html_url, "assets": assets}
+}
+
+# ---------- commands ----------
+
+gene fetch_latest_release(req) {
+    let repo = clean_repo(req["repo"])
+    if repo == "" {
+        return err("No GitHub repository configured")
+    }
+    let url = "https://api.github.com/repos/{repo}/releases/latest"
+    return need_net(url, "application/vnd.github+json",
+                    {"then": "latest", "repo": repo})
+}
+
+gene fetch_recent_releases(req) {
+    let repo = clean_repo(req["repo"])
+    if repo == "" {
+        return err("No GitHub repository configured")
+    }
+    let count = 20
+    if has(req, "count") and req["count"] != null {
+        count = req["count"]
+    }
+    if count < 1 {
+        count = 1
+    }
+    if count > 30 {
+        count = 30
+    }
+    let flagged = false
+    if has(req, "include_flagged") and req["include_flagged"] != null {
+        flagged = req["include_flagged"]
+    }
+    let url = "https://api.github.com/repos/{repo}/releases?per_page={count}"
+    return need_net(url, "application/vnd.github+json",
+                    {"then": "recent", "repo": repo, "flagged": flagged})
+}
+
+gene fetch_text(req) {
+    let url = str(req["url"]).trim()
+    let parsed = url_host(url)
+    if not parsed["valid"] {
+        return err(parsed["reason"])
+    }
+    if not in_allowlist(parsed["host"]) {
+        return err("Host {parsed['host']} is not on the resolver allowlist")
+    }
+    return need_net(url, "", {"then": "text"})
+}
+
+gene fetch_fdroid_package(req) {
+    let pkg = str(req["pkg"]).trim()
+    if pkg == "" {
+        return err("No F-Droid package configured")
+    }
+    let url = "https://f-droid.org/api/v1/packages/{pkg}"
+    return need_net(url, "", {"then": "fdroid", "pkg": pkg})
+}
+
+gene start_download(req) {
+    let url = str(req["url"])
+    let dir = ""
+    if has(req, "directory") and req["directory"] != null and req["directory"].trim() != "" {
+        dir = req["directory"]
+    } else {
+        dir = req["downloads_dir"]
+    }
+    let name = null
+    if has(req, "filename") and req["filename"] != null {
+        name = sanitize_filename(req["filename"])
+    }
+    let expected = ""
+    if has(req, "expected_sha256") and req["expected_sha256"] != null {
+        expected = req["expected_sha256"].trim()
+    }
+    let resume = false
+    if has(req, "resume") and req["resume"] != null {
+        resume = req["resume"]
+    }
+    let id = STATE["next_id"]
+    STATE["next_id"] = id + 1
+    STATE["downloads"][id] = {"attempt": 0, "expected": expected}
+    return {"ok": true, "id": id,
+            "plan": {"id": id, "url": url, "dir": dir, "name": name,
+                     "resume": resume, "expected_sha256": expected}}
+}
+
+gene cancel_download(req) {
+    let id = req["id"]
+    if has(STATE["downloads"], id) {
+        STATE["downloads"][id]["cancelled"] = true
+        return {"ok": true, "cancel": true}
+    }
+    # Unknown or already-finished id: the original command stayed silent.
+    return {"ok": true}
+}
+
+gene sanitize(req) {
+    return {"ok": true, "name": sanitize_filename(req["name"])}
+}
+
+# ---------- net continuation ----------
+
+gene gh_status_error(status) {
+    if status == 404 {
+        return "No stable release found for this project"
+    }
+    if status == 429 or status == 403 {
+        return "GitHub rate limit reached; try again in a few minutes"
+    }
+    return "GitHub returned HTTP {status}"
+}
+
+gene parse_body_or_bad(resp) {
+    let parsed = try_json_parse(resp["body"])
+    if is_err(parsed) {
+        return null
+    }
+    return unwrap(parsed)
+}
+
+gene fress_on_net(req) {
+    let ctx = req["ctx"]
+    let resp = req["resp"]
+    let then = ctx["then"]
+    if not resp["ok"] {
+        # the host prefixes transport failures with "Network error: ..."
+        return err(resp["error"])
+    }
+    if then == "latest" {
+        let status = resp["status"]
+        if status != 200 {
+            return err(gh_status_error(status))
+        }
+        let body = parse_body_or_bad(resp)
+        if body == null {
+            return err("Bad response: invalid JSON")
+        }
+        let release = parse_gh_release(body, ctx["repo"])
+        if release == null {
+            return err("Unexpected GitHub response")
+        }
+        return {"ok": true, "result": release}
+    }
+    if then == "recent" {
+        let status = resp["status"]
+        if status != 200 {
+            return err(gh_status_error(status))
+        }
+        let body = parse_body_or_bad(resp)
+        if body == null {
+            return err("Bad response: invalid JSON")
+        }
+        if type(body) != "list" {
+            return err("Unexpected GitHub response")
+        }
+        let out = []
+        for r in body {
+            if not ctx["flagged"] {
+                if has(r, "prerelease") and r["prerelease"] == true {
+                    continue
+                }
+            }
+            let release = parse_gh_release(r, ctx["repo"])
+            if release != null {
+                push(out, release)
+            }
+        }
+        return {"ok": true, "result": out}
+    }
+    if then == "text" {
+        let status = resp["status"]
+        let final_url = resp["final_url"]
+        let cl = resp["content_length"]
+        let truncated = false
+        let body = ""
+        if cl != null and cl > BODY_CAP {
+            # a body larger than the cap is NOT read - the caller gets the
+            # final URL and the content length, which is exactly what a
+            # redirect-to-file endpoint requires
+            truncated = true
+        } else {
+            body = resp["body"]
+            if resp["more"] {
+                truncated = true
+            }
+        }
+        return {"ok": true, "result": {"status": status, "final_url": final_url,
+                "content_length": cl, "body": body, "truncated": truncated}}
+    }
+    if then == "fdroid" {
+        let status = resp["status"]
+        if status == 404 {
+            return err("Package not found on F-Droid")
+        }
+        if status != 200 {
+            return err("F-Droid returned HTTP {status}")
+        }
+        let body = parse_body_or_bad(resp)
+        if body == null {
+            return err("Bad response: invalid JSON")
+        }
+        let pkg = ctx["pkg"]
+        let max_code = 0
+        if has(body, "packages") and type(body["packages"]) == "list" {
+            for p in body["packages"] {
+                if has(p, "versionCode") and type(p["versionCode"]) == "int" {
+                    if p["versionCode"] > max_code {
+                        max_code = p["versionCode"]
+                    }
+                }
+            }
+        }
+        let version_code = max_code
+        if has(body, "suggestedVersionCode") and type(body["suggestedVersionCode"]) == "int" {
+            let sugg = body["suggestedVersionCode"]
+            if sugg > 0 and (max_code == 0 or sugg <= max_code) {
+                version_code = sugg
+            }
+        }
+        if version_code <= 0 {
+            return err("No package versions found on F-Droid")
+        }
+        let version = ""
+        if has(body, "packages") and type(body["packages"]) == "list" {
+            for p in body["packages"] {
+                if has(p, "versionCode") and p["versionCode"] == version_code {
+                    if has(p, "versionName") and type(p["versionName"]) == "str" {
+                        version = p["versionName"]
+                    }
+                }
+            }
+        }
+        return {"ok": true, "result": {"package": pkg, "version": version,
+                "version_code": version_code,
+                "apk_url": "https://f-droid.org/repo/{pkg}_{version_code}.apk",
+                "page_url": "https://f-droid.org/packages/{pkg}"}}
+    }
+    return err("Unknown continuation")
+}
+
+# ---------- download continuation ----------
+
+gene checksum_norm(expected) {
+    let e = expected.trim()
+    while e.starts("0x") {
+        e = char_slice(e, 2, len(e))
+    }
+    return e.lower()
+}
+
+gene dl_on_result(req) {
+    let id = req["id"]
+    let outcome = req["outcome"]
+    if not has(STATE["downloads"], id) {
+        # unknown job (host restart raced a worker): report plainly
+        if outcome == "cancelled" {
+            return {"action": "error", "payload": {"id": id, "message": "Cancelled"}}
+        }
+        return {"action": "error", "payload": {"id": id, "message": str(req["message"]), "kind": req["kind"]}}
+    }
+    let job = STATE["downloads"][id]
+
+    if outcome == "cancelled" {
+        # Deliberate stop: the .part stays on disk so the user can resume.
+        del(STATE["downloads"], id)
+        return {"action": "error", "payload": {"id": id, "message": "Cancelled"}}
+    }
+
+    if outcome == "error" {
+        let kind = req["kind"]
+        let message = str(req["message"])
+        if kind == "network" {
+            # Transient failures (stall, dropped connection) are retried
+            # automatically: the .part is already on disk, so a resume
+            # costs nothing. Deliberate cancels, checksum failures and
+            # HTTP-status errors are never retried.
+            let attempt = job["attempt"]
+            if attempt < MAX_AUTO_RETRIES {
+                attempt += 1
+                job["attempt"] = attempt
+                return {"action": "retry", "delay_secs": 2 * attempt,
+                        "payload": {"id": id, "attempt": attempt, "message": message}}
+            }
+        }
+        del(STATE["downloads"], id)
+        let payload = {"id": id, "message": message}
+        if kind != null and kind != "" {
+            payload["kind"] = kind
+        }
+        return {"action": "error", "payload": payload}
+    }
+
+    if outcome == "complete" {
+        let staging = req["staging"]
+        let sha_hex = req["sha256"]
+        let bytes = req["bytes"]
+        let expected = ""
+        if has(job, "expected") {
+            expected = job["expected"]
+        }
+        if expected.trim() != "" {
+            let expected_norm = checksum_norm(expected)
+            if expected_norm != sha_hex.lower() {
+                # Verification is a comparison against a trusted published
+                # value, not a mere calculation. A mismatching file is
+                # rejected and removed: it must never sit in the downloads
+                # folder looking finished.
+                del(STATE["downloads"], id)
+                return {"action": "delete_and_error", "part": staging,
+                        "payload": {"id": id,
+                            "message": "Integrity check failed: the file hashes to {sha_hex} but the publisher published {expected_norm}. It was deleted. Re-download from the official source.",
+                            "kind": "checksum"}}
+            }
+            del(STATE["downloads"], id)
+            return {"action": "finalize", "part": staging,
+                    "emit": {"event": "download-complete",
+                             "payload": {"id": id, "bytes": bytes, "sha256": sha_hex,
+                                         "verified": true}}}
+        }
+        del(STATE["downloads"], id)
+        return {"action": "finalize", "part": staging,
+                "emit": {"event": "download-complete",
+                         "payload": {"id": id, "bytes": bytes, "sha256": sha_hex,
+                                     "verified": null}}}
+    }
+
+    return {"action": "error", "payload": {"id": id, "message": "Unknown download outcome"}}
+}
