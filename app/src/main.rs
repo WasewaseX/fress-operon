@@ -19,11 +19,12 @@ use serde_json::{json, Value as J};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
+use wry::{WebView, WebViewBuilder};
 
 pub const APP_VERSION: &str = "1.0.2-beta";
 
@@ -58,7 +59,7 @@ enum Msg {
 /// cancel registry.
 struct State {
     runtime: Runtime,
-    webview: wry::webview::WebView,
+    webview: WebView,
     proxy: EventLoopProxy<Msg>,
     cancels: HashMap<u32, Arc<AtomicBool>>,
     downloads_dir: String,
@@ -121,11 +122,12 @@ impl State {
             let ctx = brain["ctx"].clone();
             let proxy = self.proxy.clone();
             let text_mode = cmd == "fetch_text";
+            let cmd_owned = cmd.to_string();
             std::thread::spawn(move || {
                 let resp = net::net_get(&url, &headers, text_mode);
                 let _ = proxy.send_event(Msg::NetDone {
                     invoke_id,
-                    cmd: cmd.to_string(),
+                    cmd: cmd_owned,
                     ctx,
                     resp,
                     depth,
@@ -437,6 +439,14 @@ fn windows_machine_arch() -> Option<&'static str> {
     }
 }
 
+fn default_download_dir() -> String {
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .to_string_lossy()
+        .to_string()
+}
+
 fn app_data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -590,7 +600,7 @@ fn serve(request: wry::http::Request<Vec<u8>>) -> wry::http::Response<Vec<u8>> {
 }
 
 fn main() {
-    let event_loop: EventLoop<Msg> = EventLoop::with_user_event().build();
+    let event_loop: EventLoop<Msg> = EventLoopBuilder::<Msg>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
     // The original window config: 1280x840, min 900x600, resizable,

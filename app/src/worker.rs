@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct Plan {
     pub id: u32,
     pub url: String,
@@ -220,12 +220,12 @@ fn run_inner(
     // --- request -------------------------------------------------------
     let mut req = agent.get(&plan.url);
     if planned_resume_len > 0 {
-        req = req.header("Range", format!("bytes={}-", planned_resume_len));
+        req = req.set("Range", format!("bytes={}-", planned_resume_len));
         // If-Range makes a changed remote file answer with a plain 200
         // (full body) instead of a 206 tail - the 200 path restarts in
         // place instead of gluing an old prefix to a new suffix.
         if let Some(v) = &resume_validator {
-            req = req.header("If-Range", v.clone());
+            req = req.set("If-Range", v.clone());
         }
     }
     let first = match req.call() {

@@ -67,7 +67,7 @@ pub fn net_get(url: &str, headers: &[(String, String)], text_mode: bool) -> NetR
     };
     let mut req = agent.get(url);
     for (k, v) in headers {
-        req = req.header(k.as_str(), v.as_str());
+        req = req.set(k.as_str(), v.as_str());
     }
     let resp = match req.call() {
         Ok(r) => r,
