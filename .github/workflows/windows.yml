@@ -45,27 +45,26 @@ jobs:
           if [ "$SIZE" -gt 31457280 ]; then echo "OVER 30 MB"; exit 1; fi
 
       - name: Package (zip + SHA256SUMS)
-        shell: bash
+        shell: pwsh
         run: |
-          mkdir -p stage
-          cp target/release/fress-operon.exe stage/Fress-Operon.exe
-          cp README.md stage/README.md
-          cp LICENSE stage/LICENSE
-          cp NOTICE stage/NOTICE
-          cd stage
-          zip -q -r ../Fress-Operon-win-x64.zip .
-          cd ..
-          sha256sum Fress-Operon-win-x64.zip > SHA256SUMS.txt
-          EXE_SHA=$(sha256sum stage/Fress-Operon.exe | cut -d' ' -f1)
-          echo "exe sha256: $EXE_SHA" >> SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          New-Item -ItemType Directory -Force -Path stage | Out-Null
+          Copy-Item target\release\fress-operon.exe stage\Fress-Operon.exe
+          Copy-Item README.md stage\README.md
+          Copy-Item LICENSE stage\LICENSE
+          Copy-Item NOTICE stage\NOTICE
+          Compress-Archive -Path stage\* -DestinationPath Fress-Operon-win-x64.zip -Force
+          $zipHash = (Get-FileHash Fress-Operon-win-x64.zip -Algorithm SHA256).Hash.ToLower()
+          $exeHash = (Get-FileHash stage\Fress-Operon.exe -Algorithm SHA256).Hash.ToLower()
+          "zip sha256: $zipHash" | Out-File -Encoding ascii SHA256SUMS.txt
+          "exe sha256: $exeHash" | Out-File -Encoding ascii -Append SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
 
-      - name: Verify zip size again (with docs)
-        shell: bash
+      - name: "Verify zip size again (with docs)"
+        shell: pwsh
         run: |
-          SIZE=$(stat -c%s Fress-Operon-win-x64.zip)
-          echo "zip bytes: $SIZE"
-          if [ "$SIZE" -gt 31457280 ]; then echo "ZIP OVER 30 MB"; exit 1; fi
+          $size = (Get-Item Fress-Operon-win-x64.zip).Length
+          Write-Host "zip bytes: $size"
+          if ($size -gt 31457280) { throw "ZIP OVER 30 MB" }
 
       - uses: actions/upload-artifact@v4
         with:
