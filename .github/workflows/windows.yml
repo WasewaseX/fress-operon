@@ -37,7 +37,7 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $out -notmatch "SMOKE OK") { throw "smoke failed" }
           if ($out -notmatch "fress-operon") { throw "brain boot payload wrong" }
 
-      - name: Size gate (the lite deal: <= 30 MB)
+      - name: "Size gate (the lite deal: max 30 MB)"
         shell: bash
         run: |
           SIZE=$(stat -c%s target/release/fress-operon.exe)
