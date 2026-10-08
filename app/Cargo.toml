@@ -1,6 +1,6 @@
 [package]
 name = "fress-operon"
-version = "1.0.2-beta"
+version = "1.0.4-beta"
 edition = "2021"
 description = "Fress Operon Edition — the Fress directory app ported to the operon language: the ORIGINAL React GUI unchanged in a native webview window, the entire backend decision logic in operon"
 build = "build.rs"

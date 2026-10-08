@@ -3,7 +3,7 @@ resolver = "2"
 members = ["core", "app"]
 
 [workspace.package]
-version = "1.0.3-beta"
+version = "1.0.4-beta"
 edition = "2021"
 license = "MIT"
 

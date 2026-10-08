@@ -1,6 +1,6 @@
 [package]
 name = "fresscore"
-version = "1.0.2-beta"
+version = "1.0.4-beta"
 edition = "2021"
 description = "Fress Operon Edition core — embeds the operon interpreter and bridges the native webview host to the Fress backend logic written in operon"
 

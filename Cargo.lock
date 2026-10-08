@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "fress-operon"
-version = "1.0.2-beta"
+version = "1.0.4-beta"
 dependencies = [
  "dirs",
  "fresscore",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "fresscore"
-version = "1.0.2-beta"
+version = "1.0.4-beta"
 dependencies = [
  "operon",
  "serde_json",

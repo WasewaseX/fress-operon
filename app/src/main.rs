@@ -25,13 +25,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tao::dpi::LogicalSize;
+use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
-use wry::{WebView, WebViewBuilder};
+use wry::{Rect, WebView, WebViewBuilder};
 
-pub const APP_VERSION: &str = "1.0.3-beta";
+pub const APP_VERSION: &str = "1.0.4-beta";
 
 pub const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' https://api.github.com https://github.com https://f-droid.org; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src 'none'";
 
@@ -54,7 +54,7 @@ const INDEX_URL: &str = "fress://localhost/index.html";
 /// WebView2 error page has neither. The host probes this after startup and
 /// never lets a bare web error page face the user again.
 const PAGE_PROBE_JS: &str =
-    "JSON.stringify({shim: !!window.__TAURI_INTERNALS__, root: !!document.getElementById('root')})";
+    "JSON.stringify({shim: !!window.__TAURI_INTERNALS__, root: !!document.getElementById('root'), w: window.innerWidth|0, h: window.innerHeight|0, dpr: Math.round((window.devicePixelRatio||1)*100)})";
 
 /// Commands whose decision logic lives in the operon brain.
 const BRAIN_COMMANDS: &[&str] = &[
@@ -84,6 +84,15 @@ enum Msg {
     SmokeTimeout,
 }
 
+/// What a page probe found: content verdict + live geometry (css px +
+/// device_pixel_ratio*100) as measured inside the webview.
+struct ProbeReport {
+    ok: bool,
+    w: u64,
+    h: u64,
+    dpr: u64,
+}
+
 /// Main-thread state: the operon brain, the webview, and the download
 /// cancel registry.
 struct State {
@@ -100,6 +109,8 @@ struct State {
     smoke: bool,
     /// One automatic reload was already tried.
     reloaded: bool,
+    /// Last probe geometry: (css_width, css_height, device_pixel_ratio*100).
+    geom: Option<(u64, u64, u64)>,
 }
 
 impl State {
@@ -145,15 +156,34 @@ impl State {
         }
     }
 
-    /// Parse a probe reply: Some(true) = our page is really up (shim alive
-    /// + React root mounted), Some(false) = webview answered but it is NOT
-    /// our page (e.g. a WebView2 error page), None = unparseable.
-    fn parse_probe(raw: &str) -> Option<bool> {
+    /// Parse a probe reply. `ok` is the FULL user-facing verdict: our page
+    /// (shim alive + React root mounted) AND the webview actually filling
+    /// its window. v1.0.3-beta shipped a perfect page inside a tiny
+    /// corner-sized webview and every probe said green — geometry is part
+    /// of the verdict now, so that can never ship again.
+    fn parse_probe(raw: &str) -> Option<ProbeReport> {
         let mut v: J = serde_json::from_str(raw.trim()).ok()?;
         if v.is_string() {
             v = serde_json::from_str(v.as_str().unwrap()).ok()?;
         }
-        Some(v["shim"] == json!(true) && v["root"] == json!(true))
+        let shim = v["shim"] == json!(true);
+        let root = v["root"] == json!(true);
+        let w = v["w"].as_u64().unwrap_or(0);
+        let h = v["h"].as_u64().unwrap_or(0);
+        let dpr = v["dpr"].as_u64().unwrap_or(0);
+        Some(ProbeReport {
+            ok: shim && root && State::geom_ok(w, h),
+            w,
+            h,
+            dpr,
+        })
+    }
+
+    /// Geometry floor: at the default 1280x840 (min 900x600) window these
+    /// are far below nominal yet far above the corner thumbnail that a
+    /// mis-sized webview produces. CSS pixels, so DPI-independent.
+    fn geom_ok(w: u64, h: u64) -> bool {
+        w >= 800 && h >= 500
     }
 
     /// Smoke-mode finish: write the result file next to the exe (CI reads
@@ -161,11 +191,17 @@ impl State {
     fn finish_smoke(&self, ok: bool) -> ! {
         let brain = self.brain_ok == Some(true);
         let page = self.page_ok == Some(true);
+        let geom = match self.geom {
+            Some((w, h, dpr)) if State::geom_ok(w, h) => format!("OK {}x{}@{}", w, h, dpr),
+            Some((w, h, dpr)) => format!("BAD {}x{}@{}", w, h, dpr),
+            None => "?".to_string(),
+        };
         let line = format!(
-            "{} brain={} page={}",
+            "{} brain={} page={} geom={}",
             if ok { "SMOKE OK" } else { "SMOKE FAIL" },
             if brain { "ok" } else { "fail" },
             if page { "PAGE OK" } else { "PAGE FAIL" },
+            geom,
         );
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
@@ -772,12 +808,15 @@ fn main() {
     let proxy = event_loop.create_proxy();
 
     // The original window config: 1280x840, min 900x600, resizable,
-    // centered, title "Fress".
+    // centered, title "Fress". Created HIDDEN: the user's first frame must
+    // be the app itself, never a white rectangle — the window is shown
+    // only after the webview exists and fills the client area.
     let window = match WindowBuilder::new()
         .with_title("Fress")
         .with_inner_size(LogicalSize::new(1280.0, 840.0))
         .with_min_inner_size(LogicalSize::new(900.0, 600.0))
         .with_resizable(true)
+        .with_visible(false)
         .build(&event_loop)
     {
         Ok(w) => w,
@@ -846,7 +885,16 @@ fn main() {
                 }
             }
         })
-        .build_as_child(&window)
+        // ROOT CAUSE of the v1.0.3-beta "tiny app in the corner of a big
+        // white window" bug, for whoever reads this next: build_as_child()
+        // on Windows creates the webview container with CW_USEDEFAULT
+        // geometry (invalid for a WS_CHILD window — it lands at 0x0-ish in
+        // the top-left corner) and, worse, wry attaches its WM_SIZE resize
+        // subclass ONLY in the non-child path — so the webview never grows
+        // and never tracks the window. build() is the path Tauri itself
+        // uses: the webview is created at the parent's client size and the
+        // parent is subclassed for WM_SIZE / focus / position tracking.
+        .build(&window)
     {
         Ok(w) => w,
         Err(e) => {
@@ -859,6 +907,12 @@ fn main() {
         }
     };
 
+    // Everything is composed — show the window. The first frame the user
+    // sees is the app itself, never a white rectangle. Showing also fires
+    // one WM_SIZE with wry's resize subclass attached, which re-asserts
+    // the webview fill as a side effect.
+    window.set_visible(true);
+
     let mut state = State {
         runtime,
         webview,
@@ -869,6 +923,7 @@ fn main() {
         brain_ok: None,
         smoke,
         reloaded: false,
+        geom: None,
     };
 
     // Page-load verification: after the boot settles, probe the webview for
@@ -902,8 +957,30 @@ fn main() {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::WindowEvent { event, .. } => {
-                if let WindowEvent::CloseRequested = event {
-                    *control_flow = ControlFlow::Exit;
+                match event {
+                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                    // Belt and braces: wry's parent subclass already tracks
+                    // WM_SIZE, but v1.0.3-beta proved what one stale bounds
+                    // value looks like. Re-assert the fill on every resize
+                    // and every DPI change — cheap, idempotent, and it keeps
+                    // the webview glued to the window no matter what.
+                    WindowEvent::Resized(size) => {
+                        if size.width > 0 && size.height > 0 {
+                            let _ = state.webview.set_bounds(Rect {
+                                position: PhysicalPosition::new(0, 0).into(),
+                                size: size.into(),
+                            });
+                        }
+                    }
+                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                        if new_inner_size.width > 0 && new_inner_size.height > 0 {
+                            let _ = state.webview.set_bounds(Rect {
+                                position: PhysicalPosition::new(0, 0).into(),
+                                size: (*new_inner_size).into(),
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
             Event::UserEvent(msg) => match msg {
@@ -923,17 +1000,17 @@ fn main() {
                     state.request_probe();
                 }
                 Msg::ProbeResult(raw) => match State::parse_probe(&raw) {
-                    Some(true) => {
-                        state.page_ok = Some(true);
-                        if state.smoke && state.brain_ok.is_some() {
-                            state.finish_smoke(state.brain_ok == Some(true));
-                        }
-                    }
-                    Some(false) => {
-                        // One automatic recovery attempt in normal mode:
-                        // re-navigate once (handles a startup race),
-                        // re-probe, then the final verdict decides.
-                        if !state.smoke && !state.reloaded {
+                    Some(report) => {
+                        state.geom = Some((report.w, report.h, report.dpr));
+                        state.page_ok = Some(report.ok);
+                        if report.ok {
+                            if state.smoke && state.brain_ok.is_some() {
+                                state.finish_smoke(state.brain_ok == Some(true));
+                            }
+                        } else if !state.smoke && !state.reloaded {
+                            // One automatic recovery attempt in normal mode:
+                            // re-navigate once (handles a startup race),
+                            // re-probe, then the final verdict decides.
                             state.reloaded = true;
                             let _ = state.webview.evaluate_script("location.reload()");
                             let retry = state.proxy.clone();

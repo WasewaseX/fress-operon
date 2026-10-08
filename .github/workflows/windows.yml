@@ -44,6 +44,7 @@ jobs:
           if ($result -notmatch "SMOKE OK") { throw "smoke verdict missing/failed" }
           if ($result -notmatch "brain=ok") { throw "brain boot payload wrong" }
           if ($result -notmatch "page=PAGE OK") { throw "PAGE FAILED TO LOAD — the v1.0.2-beta regression guard fired" }
+          if ($result -notmatch "geom=OK") { throw "WEBVIEW GEOMETRY WRONG — the v1.0.3-beta tiny-webview regression guard fired" }
 
       - name: "Size gate (the lite deal: max 30 MB)"
         shell: bash

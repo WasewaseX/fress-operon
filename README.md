@@ -77,11 +77,23 @@ cargo build --release        # Windows is the release target; a GUI-less
 cargo test -p fresscore
 ```
 
-## Honest notes (v1.0.2-beta parity)
+## Honest notes (versioning + parity)
 
-- `app_version()` reports `1.0.2-beta`, so the in-app self-update sees the
-  operon edition at parity with upstream `v1.0.2-beta` and stays quiet
-  until upstream ships something newer.
+- `app_version()` reports `1.0.4-beta` — this port's own version line. The
+  GUI still ships the upstream `v1.0.2-beta` frontend bundle unchanged;
+  1.0.3 fixed the WebView2 error page + console window, 1.0.4 fixes the
+  webview geometry (below). The in-app self-update compares against
+  upstream `WasewaseX/Fress` releases and stays quiet while upstream has
+  nothing newer than the bundled UI baseline.
+- v1.0.4 render fix, in one paragraph: the window is now created hidden,
+  the webview is built through wry's parented `build()` path (the one
+  Tauri uses — `build_as_child()` on Windows leaves the webview container
+  at CW_USEDEFAULT geometry and never attaches its WM_SIZE resize
+  subclass, which is the "tiny app pinned in the corner of a big white
+  window" bug), and the window is shown only after the page fills the
+  client area — so there is no white flash either. Resize and DPI changes
+  re-assert the fill from the host side, and the CI smoke now measures
+  the webview from the inside and fails on bad geometry (`geom=OK`).
 - localStorage sits under `FressOperon/WebView2` (different webview origin
   than Tauri's), so the download-folder preference and theme start fresh
   once.
