@@ -10,6 +10,11 @@
 //! worker threads that report back through the event-loop proxy. The brain
 //! decides, the host acts.
 
+// Windows release builds are GUI-subsystem apps: double-clicking the exe
+// opens the app window ONLY — no terminal window, exactly like any other
+// desktop app. Debug builds keep the console for development logging.
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod net;
 mod util;
 mod worker;
@@ -26,14 +31,30 @@ use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
 use wry::{WebView, WebViewBuilder};
 
-pub const APP_VERSION: &str = "1.0.2-beta";
+pub const APP_VERSION: &str = "1.0.3-beta";
 
 pub const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' https://api.github.com https://github.com https://f-droid.org; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src 'none'";
 
+// wry 0.46 registers the WebView2 custom-protocol interception filter for
+// the DEFAULT scheme `http` (http://fress.*) — `with_https_scheme(true)` is
+// required to serve it over https. Navigating to https://fress.localhost
+// while the filter only covers http:// fell through to the network stack:
+// Chromium resolves *.localhost to 127.0.0.1, finds nothing on port 443 and
+// renders WebView2's "can't reach this page" error — the exact bug users saw
+// in v1.0.2-beta. Stay on the default http scheme (Tauri v2 does the same
+// with http://tauri.localhost); localhost origins are trusted contexts in
+// Chromium, so crypto.subtle and friends keep working.
 #[cfg(target_os = "windows")]
-const INDEX_URL: &str = "https://fress.localhost/index.html";
+const INDEX_URL: &str = "http://fress.localhost/index.html";
 #[cfg(not(target_os = "windows"))]
 const INDEX_URL: &str = "fress://localhost/index.html";
+
+/// Runs inside the webview after boot: the page is REALLY ours only when
+/// the shim is alive AND the frontend bundle mounted its React root. A
+/// WebView2 error page has neither. The host probes this after startup and
+/// never lets a bare web error page face the user again.
+const PAGE_PROBE_JS: &str =
+    "JSON.stringify({shim: !!window.__TAURI_INTERNALS__, root: !!document.getElementById('root')})";
 
 /// Commands whose decision logic lives in the operon brain.
 const BRAIN_COMMANDS: &[&str] = &[
@@ -53,6 +74,14 @@ enum Msg {
     DlDone { plan: worker::Plan, report: worker::Report },
     /// CI smoke: boot the whole stack headless-ish, then exit 0.
     Smoke,
+    /// Fire the page probe (shim + React root check).
+    ProbePage,
+    /// Probe verdict came back from the webview callback.
+    ProbeResult(String),
+    /// Final page verdict: recover or fail loudly — never a silent death.
+    ProbeFinal,
+    /// Smoke fail-safe: exit(1) if the boot never reached a verdict.
+    SmokeTimeout,
 }
 
 /// Main-thread state: the operon brain, the webview, and the download
@@ -63,6 +92,14 @@ struct State {
     proxy: EventLoopProxy<Msg>,
     cancels: HashMap<u32, Arc<AtomicBool>>,
     downloads_dir: String,
+    /// Page-load verdict (shim + React root seen).
+    page_ok: Option<bool>,
+    /// Smoke-mode brain verdict.
+    brain_ok: Option<bool>,
+    /// --smoke mode flag.
+    smoke: bool,
+    /// One automatic reload was already tried.
+    reloaded: bool,
 }
 
 impl State {
@@ -85,12 +122,58 @@ impl State {
 
     fn brain_call(&mut self, gene: &str, arg_json: &str) -> Result<J, String> {
         let out = self.runtime.call(gene, Some(arg_json))?;
+        // GUI-subsystem builds have no stderr — and println to a dead
+        // console panics. Route brain logs to a file instead (best-effort).
         for line in self.runtime.drain_logs() {
-            eprintln!("[fress-operon] {}", line);
+            host_log(&line);
         }
         serde_json::from_str(&out).map_err(|e| {
             format!("brain response is not a JSON object: {} :: {}", e, out)
         })
+    }
+
+    /// Fire the page probe: the verdict comes back asynchronously through
+    /// Msg::ProbeResult (wry serializes the evaluation result into the
+    /// callback; evaluate_script itself returns nothing).
+    fn request_probe(&self) {
+        let proxy = self.proxy.clone();
+        let r = self.webview.evaluate_script_with_callback(PAGE_PROBE_JS, move |raw| {
+            let _ = proxy.send_event(Msg::ProbeResult(raw));
+        });
+        if r.is_err() {
+            host_log("page probe: evaluate_script_with_callback failed");
+        }
+    }
+
+    /// Parse a probe reply: Some(true) = our page is really up (shim alive
+    /// + React root mounted), Some(false) = webview answered but it is NOT
+    /// our page (e.g. a WebView2 error page), None = unparseable.
+    fn parse_probe(raw: &str) -> Option<bool> {
+        let mut v: J = serde_json::from_str(raw.trim()).ok()?;
+        if v.is_string() {
+            v = serde_json::from_str(v.as_str().unwrap()).ok()?;
+        }
+        Some(v["shim"] == json!(true) && v["root"] == json!(true))
+    }
+
+    /// Smoke-mode finish: write the result file next to the exe (CI reads
+    /// it — a GUI-subsystem exe has no stdout pipes) and exit.
+    fn finish_smoke(&self, ok: bool) -> ! {
+        let brain = self.brain_ok == Some(true);
+        let page = self.page_ok == Some(true);
+        let line = format!(
+            "{} brain={} page={}",
+            if ok { "SMOKE OK" } else { "SMOKE FAIL" },
+            if brain { "ok" } else { "fail" },
+            if page { "PAGE OK" } else { "PAGE FAIL" },
+        );
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let _ = std::fs::write(dir.join("smoke-result.txt"), &line);
+            }
+        }
+        println!("{}", line);
+        std::process::exit(if ok { 0 } else { 1 });
     }
 
     /// Route a brain response envelope: final result / error / net
@@ -602,19 +685,108 @@ fn serve(
     }
 }
 
+/// Best-effort host log (GUI-subsystem apps have no console; a real file
+/// also gives users something to send when reporting a problem).
+fn host_log(line: &str) {
+    use std::io::Write;
+    let path = app_data_dir().join("fress-host.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
+/// Native error dialog — never let the user face a bare web error page or
+/// an instantly-vanishing console panic again.
+#[cfg(target_os = "windows")]
+fn msgbox(title: &str, text: &str) {
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut core::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            utype: u32,
+        ) -> i32;
+    }
+    const MB_ICONERROR: u32 = 0x10;
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            wide(text).as_ptr(),
+            wide(title).as_ptr(),
+            MB_ICONERROR,
+        )
+    };
+}
+
+#[cfg(not(target_os = "windows"))]
+fn msgbox(title: &str, text: &str) {
+    host_log(&format!("{}: {}", title, text));
+}
+
+/// Release builds are GUI-subsystem apps (no console). CI's --smoke run
+/// re-attaches the parent console best-effort so interactive runs still
+/// show output; the authoritative smoke verdict goes to a result file.
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn attach_parent_console() {}
+
 fn main() {
+    let smoke = std::env::args().any(|a| a == "--smoke");
+    if smoke {
+        attach_parent_console();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let _ = std::fs::remove_file(dir.join("smoke-result.txt"));
+            }
+        }
+    }
+
+    // Release/Windows: a panic used to vanish with the process ("showed
+    // unbelievable nothing"). Surface it in a native dialog instead.
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    {
+        std::panic::set_hook(Box::new(|info| {
+            msgbox(
+                "Fress — unexpected error",
+                &format!("Fress hit an unexpected error and must close.\n\n{}", info),
+            );
+        }));
+    }
+
     let event_loop: EventLoop<Msg> = EventLoopBuilder::<Msg>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
     // The original window config: 1280x840, min 900x600, resizable,
     // centered, title "Fress".
-    let window = WindowBuilder::new()
+    let window = match WindowBuilder::new()
         .with_title("Fress")
         .with_inner_size(LogicalSize::new(1280.0, 840.0))
         .with_min_inner_size(LogicalSize::new(900.0, 600.0))
         .with_resizable(true)
         .build(&event_loop)
-        .expect("window");
+    {
+        Ok(w) => w,
+        Err(e) => {
+            let m = format!("Fress could not create its window.\n\n{}", e);
+            msgbox("Fress — cannot start", &m);
+            std::process::exit(1);
+        }
+    };
 
     if let Some(monitor) = window.current_monitor().or_else(|| window.primary_monitor()) {
         let ms = monitor.size();
@@ -638,8 +810,18 @@ fn main() {
         env: vec![],
     };
     let brain_path = write_brain(&app_root);
-    let runtime = fresscore::Runtime::boot(&brain_path, &grants)
-        .expect("operon brain failed to boot");
+    let runtime = match fresscore::Runtime::boot(&brain_path, &grants) {
+        Ok(r) => r,
+        Err(e) => {
+            let m = format!(
+                "The operon brain failed to boot.\n\n{}\n\nTry deleting the folder:\n{}",
+                e,
+                app_root.display()
+            );
+            msgbox("Fress — cannot start", &m);
+            std::process::exit(1);
+        }
+    };
 
     let downloads_dir = default_download_dir();
 
@@ -648,7 +830,7 @@ fn main() {
     let ipc_proxy = proxy.clone();
     let shim = include_str!("shim.js").to_string();
     let mut web_context = wry::WebContext::new(Some(webview_data));
-    let webview = WebViewBuilder::with_web_context(&mut web_context)
+    let webview = match WebViewBuilder::with_web_context(&mut web_context)
         .with_url(INDEX_URL)
         .with_initialization_script(&shim)
         .with_custom_protocol("fress".into(), serve)
@@ -665,7 +847,17 @@ fn main() {
             }
         })
         .build_as_child(&window)
-        .expect("webview");
+    {
+        Ok(w) => w,
+        Err(e) => {
+            let m = format!(
+                "Fress needs the Microsoft WebView2 Runtime to render its window,\nand it is missing or broken on this machine.\n\n{}\n\nFix: install the Evergreen Runtime (free, ~2 minutes):\nhttps://go.microsoft.com/fwlink/p/?LinkId=2124703\nthen start Fress again.",
+                e
+            );
+            msgbox("Fress — WebView2 Runtime required", &m);
+            std::process::exit(1);
+        }
+    };
 
     let mut state = State {
         runtime,
@@ -673,15 +865,36 @@ fn main() {
         proxy,
         cancels: HashMap::new(),
         downloads_dir,
+        page_ok: None,
+        brain_ok: None,
+        smoke,
+        reloaded: false,
     };
 
+    // Page-load verification: after the boot settles, probe the webview for
+    // OUR page (shim alive + React root mounted). The v1.0.2-beta bug (a
+    // WebView2 "can't reach this page" error where the app should be) passed
+    // CI because nothing verified the page — this closes that hole for good.
+    {
+        let probe_proxy = state.proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            let _ = probe_proxy.send_event(Msg::ProbePage);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let _ = probe_proxy.send_event(Msg::ProbeFinal);
+        });
+    }
+
     // --smoke: boot the full stack (brain + webview + embedded frontend),
-    // prove the window comes up, then exit 0. Used by CI on real Windows.
-    if std::env::args().any(|a| a == "--smoke") {
+    // prove the window AND the page come up, then exit 0. Used by CI on
+    // real Windows. The fail-safe timer guarantees the run always ends.
+    if smoke {
         let smoke_proxy = state.proxy.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(6));
             let _ = smoke_proxy.send_event(Msg::Smoke);
+            std::thread::sleep(std::time::Duration::from_secs(9));
+            let _ = smoke_proxy.send_event(Msg::SmokeTimeout);
         });
     }
 
@@ -695,12 +908,66 @@ fn main() {
             }
             Event::UserEvent(msg) => match msg {
                 Msg::Smoke => {
+                    // Record the brain verdict; the probe timers own the
+                    // exit so the page result is always included.
                     let boot = state
                         .brain_call("main", "{}")
                         .unwrap_or_else(|e| json!({"ok": false, "error": e}));
-                    println!("SMOKE OK brain={}", boot);
-                    *control_flow = ControlFlow::Exit;
-                    std::process::exit(if boot["ok"] == json!(true) { 0 } else { 1 });
+                    state.brain_ok = Some(boot["ok"] == json!(true));
+                    println!("SMOKE brain={}", boot);
+                    if state.page_ok == Some(true) {
+                        state.finish_smoke(state.brain_ok == Some(true));
+                    }
+                }
+                Msg::ProbePage => {
+                    state.request_probe();
+                }
+                Msg::ProbeResult(raw) => match State::parse_probe(&raw) {
+                    Some(true) => {
+                        state.page_ok = Some(true);
+                        if state.smoke && state.brain_ok.is_some() {
+                            state.finish_smoke(state.brain_ok == Some(true));
+                        }
+                    }
+                    Some(false) => {
+                        // One automatic recovery attempt in normal mode:
+                        // re-navigate once (handles a startup race),
+                        // re-probe, then the final verdict decides.
+                        if !state.smoke && !state.reloaded {
+                            state.reloaded = true;
+                            let _ = state.webview.evaluate_script("location.reload()");
+                            let retry = state.proxy.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_secs(3));
+                                let _ = retry.send_event(Msg::ProbePage);
+                            });
+                        }
+                    }
+                    None => {
+                        // The webview answered but the probe value was not
+                        // parseable — only possible if our page never ran.
+                        host_log(&format!("page probe: unparseable reply: {}", raw));
+                    }
+                },
+                Msg::ProbeFinal => {
+                    if state.page_ok != Some(true) {
+                        if state.smoke {
+                            state.finish_smoke(false);
+                        }
+                        let m = format!(
+                            "Fress started but its interface could not load.\n\nThis is almost always an outdated or broken Microsoft\nWebView2 Runtime.\n\nFix: install the Evergreen Runtime (free, ~2 minutes):\nhttps://go.microsoft.com/fwlink/p/?LinkId=2124703\nthen start Fress again.\n\nTechnical details were written to:\n{}",
+                            app_data_dir().join("fress-host.log").display()
+                        );
+                        msgbox("Fress — interface failed to load", &m);
+                        std::process::exit(1);
+                    }
+                    if state.smoke && state.brain_ok == Some(true) {
+                        state.finish_smoke(true);
+                    }
+                }
+                Msg::SmokeTimeout => {
+                    // Boot never reached a verdict — always fail loudly.
+                    state.finish_smoke(false);
                 }
                 Msg::Invoke { id, cmd, args } => state.handle_invoke(id, cmd, args),
                 Msg::NetDone { invoke_id, cmd, ctx, resp, depth } => {

@@ -16,9 +16,9 @@ fn main() {
     if !index.exists() {
         fs::write(
             &index,
-            "<!doctype html><meta charset=\"utf-8\"><title>Fress Operon</title>\
+            "<!doctype html><html><body><div id=\"root\"></div><meta charset=\"utf-8\"><title>Fress Operon</title>\
              <p style=\"font-family:system-ui;padding:2rem\">Frontend not built. \
-             Run scripts/build-frontend.sh (CI does this) and rebuild.</p>",
+             Run scripts/build-frontend.sh (CI does this) and rebuild.</p></body></html>",
         )
         .expect("write placeholder");
     }

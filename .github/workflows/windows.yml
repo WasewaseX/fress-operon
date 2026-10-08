@@ -31,14 +31,19 @@ jobs:
       - name: Build host (release)
         run: cargo build --release -p fress-operon
 
-      - name: Smoke the shipped exe (GUI boot path, brain, embedded frontend)
+      - name: Smoke the shipped exe (GUI boot path, brain, page really loads)
         run: |
           $exe = "target\release\fress-operon.exe"
           if (-not (Test-Path $exe)) { throw "exe missing" }
-          $out = & $exe --smoke 2>&1 | Out-String
-          Write-Host $out
-          if ($LASTEXITCODE -ne 0 -or $out -notmatch "SMOKE OK") { throw "smoke failed" }
-          if ($out -notmatch "fress-operon") { throw "brain boot payload wrong" }
+          $p = Start-Process -FilePath $exe -ArgumentList "--smoke" -PassThru -Wait
+          $code = $p.ExitCode
+          $result = if (Test-Path "target\release\smoke-result.txt") { Get-Content "target\release\smoke-result.txt" -Raw } else { "" }
+          Write-Host "exit code: $code"
+          Write-Host $result
+          if ($code -ne 0) { throw "smoke exited with $code" }
+          if ($result -notmatch "SMOKE OK") { throw "smoke verdict missing/failed" }
+          if ($result -notmatch "brain=ok") { throw "brain boot payload wrong" }
+          if ($result -notmatch "page=PAGE OK") { throw "PAGE FAILED TO LOAD — the v1.0.2-beta regression guard fired" }
 
       - name: "Size gate (the lite deal: max 30 MB)"
         shell: bash
